@@ -1,21 +1,30 @@
 #include "naive_gdd_validator.h"
 
+#include <algorithm>
+#include <cassert>
+#include <span>
+
 namespace algos {
 
-GddValidator::GddHoldsResult NaiveGddValidator::Holds(model::Gdd const& gdd,
-                                                      model::gdd::graph_t const& graph) {
-    match_count_ = 0;
-    model::gdd::graph_t const& pattern = gdd.GetPattern();
-    if (domain_ = BuildDomain(pattern, graph); domain_.size() == boost::num_vertices(pattern)) {
-        MappingT partial_map;
-        partial_map.reserve(boost::num_vertices(pattern));
-        if (GddCounterexample counterexample{};
-            ExistsCounterexample(gdd, graph, partial_map, counterexample)) {
-            return {counterexample, match_count_};
-        }
+void NaiveGddValidator::HoldsGroup(std::span<model::Gdd const* const> group,
+                                   model::gdd::graph_t const& graph,
+                                   std::span<GddHoldsResult> output) {
+    assert(group.size() == output.size());
+    std::ranges::fill(output, GddHoldsResult{});
+
+    if (group.empty()) {
+        return;
     }
 
-    return {std::nullopt, match_count_};
+    model::gdd::graph_t const& pattern = group.front()->GetPattern();
+    if (domain_ = BuildDomain(pattern, graph); domain_.size() != boost::num_vertices(pattern)) {
+        return;
+    }
+
+    MappingT partial_map;
+    partial_map.reserve(boost::num_vertices(pattern));
+    std::size_t remaining = group.size();
+    FindCounterexamples(group, graph, pattern, partial_map, output, remaining);
 }
 
 std::unique_ptr<GddValidator> NaiveGddValidator::CreateWorker() const {
@@ -70,21 +79,27 @@ bool NaiveGddValidator::CanExtendMapping(model::gdd::graph_t const& graph,
     });
 }
 
-bool NaiveGddValidator::ExistsCounterexample(model::Gdd const& gdd,
-                                             model::gdd::graph_t const& graph,
-                                             MappingT& partial_map,
-                                             GddCounterexample& counterexample) {
+bool NaiveGddValidator::FindCounterexamples(std::span<model::Gdd const* const> group,
+                                            model::gdd::graph_t const& graph,
+                                            model::gdd::graph_t const& pattern,
+                                            MappingT& partial_map, std::span<GddHoldsResult> output,
+                                            std::size_t& remaining) {
     if (partial_map.size() == domain_.size()) {
-        ++match_count_;
-        bool const sat = gdd.Satisfies(graph, partial_map);
+        for (std::size_t gdd_index = 0; gdd_index < group.size(); ++gdd_index) {
+            if (output[gdd_index].ce.has_value()) {
+                continue;
+            }
 
-        if (!sat) {
-            counterexample = model::BuildCounterexample(gdd.GetPattern(), graph, partial_map);
+            ++output[gdd_index].match_count;
+            if (!group[gdd_index]->Satisfies(graph, partial_map)) {
+                output[gdd_index].ce = model::BuildCounterexample(pattern, graph, partial_map);
+                --remaining;
+            }
         }
-        return !sat;
+
+        return remaining == 0;
     }
 
-    auto const& pattern = gdd.GetPattern();
     for (auto const& [pattern_var, graph_vertex_candidates] : domain_) {
         if (partial_map.contains(pattern_var)) {
             continue;
@@ -100,7 +115,7 @@ bool NaiveGddValidator::ExistsCounterexample(model::Gdd const& gdd,
                 continue;
             }
 
-            if (ExistsCounterexample(gdd, graph, partial_map, counterexample)) {
+            if (FindCounterexamples(group, graph, pattern, partial_map, output, remaining)) {
                 return true;
             }
 

@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <memory>
-#include <span>
+#include <vector>
 
 #include "core/algorithms/algorithm.h"
 #include "core/algorithms/gdd/gdd.h"
@@ -11,58 +11,10 @@
 #include "core/config/option_using.h"
 #include "core/config/thread_number/option.h"
 #include "core/parser/graph_parser/graph_parser.h"
-#include "core/util/worker_thread_pool.h"
+#include "gdd_pattern_grouping.h"
+#include "gdd_validation_executor.h"
 
 namespace algos {
-
-struct GddValidator::ValidationExecutor {
-    virtual void Execute(GddValidator& validator, std::span<model::Gdd const> gdds,
-                         model::gdd::graph_t const& graph,
-                         std::span<GddHoldsResult> output) const = 0;
-
-    virtual ~ValidationExecutor() = default;
-};
-
-struct GddValidator::SequentialValidationExecutor : ValidationExecutor {
-    virtual void Execute(GddValidator& validator, std::span<model::Gdd const> gdds,
-                         model::gdd::graph_t const& graph,
-                         std::span<GddHoldsResult> output) const final {
-        assert(gdds.size() == output.size());
-        for (std::size_t i = 0; i < gdds.size(); ++i) {
-            output[i] = validator.Holds(gdds[i], graph);
-        }
-    }
-};
-
-// decorator on top of another executor
-struct GddValidator::ParallelValidationExecutor : ValidationExecutor {
-private:
-    std::unique_ptr<ValidationExecutor> inner_;
-    std::size_t threads_;
-
-public:
-    ParallelValidationExecutor(std::unique_ptr<ValidationExecutor> inner, std::size_t threads)
-        : inner_(std::move(inner)), threads_(threads) {
-        assert(inner_ != nullptr);
-        assert(threads_ > 1);
-    }
-
-    virtual void Execute(GddValidator& validator, std::span<model::Gdd const> gdds,
-                         model::gdd::graph_t const& graph,
-                         std::span<GddHoldsResult> output) const final {
-        assert(gdds.size() == output.size());
-        assert(gdds.size() >= threads_);
-
-        util::WorkerThreadPool pool{threads_};
-        pool.ExecIndexWithResource(
-                [this, gdds, &graph, output](model::Index index,
-                                             std::unique_ptr<GddValidator> const& worker) {
-                    inner_->Execute(*worker, gdds.subspan(index, 1), graph,
-                                    output.subspan(index, 1));
-                },
-                [&validator]() { return validator.CreateWorker(); }, gdds.size());
-    }
-};
 
 void GddValidator::ResetState() {
     result_.clear();
@@ -93,19 +45,28 @@ void GddValidator::MakeExecuteOptsAvailable() {
 }
 
 void GddValidator::ExecuteInternal() {
-    std::vector<GddHoldsResult> check_results(gdds_.size());
+    PatternGrouping const grouping = PatternGrouping::GroupByPattern(gdds_);
+    std::size_t const group_count = grouping.GroupCount();
+
+    std::vector<GddHoldsResult> grouped_results(gdds_.size());
 
     std::unique_ptr<ValidationExecutor> executor = std::make_unique<SequentialValidationExecutor>();
-    if (std::size_t const actual_threads = std::min<std::size_t>(threads_, gdds_.size());
+    if (std::size_t const actual_threads = std::min<std::size_t>(threads_, group_count);
         actual_threads > 1) {
         executor =
                 std::make_unique<ParallelValidationExecutor>(std::move(executor), actual_threads);
     }
-    executor->Execute(*this, gdds_, graph_, check_results);
+    executor->Execute(*this, grouping, 0, group_count, graph_, grouped_results);
+
+    // undo the reordering done by the grouping: results are reported in input order
+    std::vector<GddHoldsResult> ordered_results(gdds_.size());
+    for (std::size_t i = 0; i < grouping.origin.size(); ++i) {
+        ordered_results[grouping.origin[i]] = std::move(grouped_results[i]);
+    }
 
     result_.reserve(gdds_.size());
     for (std::size_t gdd_index = 0; gdd_index < gdds_.size(); ++gdd_index) {
-        auto& [ce, match_count] = check_results[gdd_index];
+        auto& [ce, match_count] = ordered_results[gdd_index];
         matches_count_.push_back(match_count);
         if (ce.has_value()) {
             ce->gdd_index = gdd_index;
