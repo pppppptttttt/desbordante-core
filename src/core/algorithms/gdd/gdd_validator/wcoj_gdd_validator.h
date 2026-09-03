@@ -117,11 +117,18 @@ private:
     std::vector<VertexT> const& GetNeighbors(VertexT graph_vertex, Direction direction,
                                              std::string const& edge_label);
 
-    // `IntersectSorted` is in hot path, scratch_ is a buffer that supposed not to shrink
-    // its capacity and be used for insertions of `std::set_intersection` result
-    std::vector<VertexT> scratch_;
-    void IntersectSorted(std::vector<std::vector<VertexT> const*>& lists,
-                         std::vector<VertexT>& out);
+    // set intersections is in hot path, the optimal way to deal with them
+    // is "Leapfrog join for unary predicates"; see https://arxiv.org/pdf/1210.0481
+    // this algo has complexity of O(N_{min} * log(N_{max}/N_{min})) instead of
+    // pairwise intersection which is O(N_{max} * lists.size())
+    struct ListCursor {
+        VertexT const* cursor;
+        VertexT const* end;
+    };
+
+    // reused by LeapFrogJoin, supposed not to shrink
+    std::vector<ListCursor> cursors_;
+    void LeapFrogJoin(std::vector<std::vector<VertexT> const*>& lists, std::vector<VertexT>& out);
 
     std::unordered_map<NeighborKey, std::vector<VertexT>, NeighborKeyHash> adjacency_index_;
 
